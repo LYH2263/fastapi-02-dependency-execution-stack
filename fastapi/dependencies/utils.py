@@ -65,6 +65,11 @@ from fastapi.dependencies.models import (
     _is_gen_callable,
     _UsesScopesCache,
 )
+from fastapi.dependencies.policy import (
+    _DependencyPolicySnapshot,
+    capture_dependency_policy,
+    policy_partitions_cache_key,
+)
 from fastapi.exceptions import DependencyScopeError
 from fastapi.logger import logger
 from fastapi.security.oauth2 import SecurityScopes
@@ -640,6 +645,11 @@ class SolvedDependency:
     dependency_cache: dict[DependencyCacheKey, Any]
 
 
+# Sentinel distinguishing the entry point of a solve tree from recursive calls,
+# which thread the captured request-level policy snapshot explicitly.
+_POLICY_SNAPSHOT_UNSET: Any = object()
+
+
 async def solve_dependencies(
     *,
     request: Request | WebSocket,
@@ -654,6 +664,7 @@ async def solve_dependencies(
     async_exit_stack: AsyncExitStack,
     embed_body_fields: bool,
     _uses_scopes_cache: _UsesScopesCache | None = None,
+    _policy_snapshot: _DependencyPolicySnapshot | None = _POLICY_SNAPSHOT_UNSET,
 ) -> SolvedDependency:
     request_astack = request.scope.get("fastapi_inner_astack")
     assert isinstance(request_astack, AsyncExitStack), (
@@ -663,6 +674,14 @@ async def solve_dependencies(
     assert isinstance(function_astack, AsyncExitStack), (
         "fastapi_function_astack not found in request scope"
     )
+    # Capture the request-level dependency execution policy (overrides, cache
+    # partition and extra OAuth scopes) once for the whole dependency tree.
+    # ``None`` means the policy stack is empty, preserving the historical path
+    # exactly.
+    if _policy_snapshot is _POLICY_SNAPSHOT_UNSET:
+        _policy_snapshot = capture_dependency_policy(
+            dependency_overrides_provider=dependency_overrides_provider
+        )
     values: dict[str, Any] = {}
     errors: list[Any] = []
     if response is None:
@@ -677,7 +696,22 @@ async def solve_dependencies(
         sub_dependant.call = cast(Callable[..., Any], sub_dependant.call)
         call = sub_dependant.call
         use_sub_dependant = sub_dependant
-        if (
+        if _policy_snapshot is not None:
+            # Request-level policy stack frames take precedence over the
+            # application-level dependency_overrides mapping; the snapshot
+            # already contains the merged effective view.
+            original_call = sub_dependant.call
+            call = _policy_snapshot.overrides.get(original_call, original_call)
+            if call is not original_call:
+                use_path: str = sub_dependant.path  # type: ignore
+                use_sub_dependant = get_dependant(
+                    path=use_path,
+                    call=call,
+                    name=sub_dependant.name,
+                    parent_oauth_scopes=_get_oauth_scopes(dependant=sub_dependant),
+                    scope=sub_dependant.scope,
+                )
+        elif (
             dependency_overrides_provider
             and dependency_overrides_provider.dependency_overrides
         ):
@@ -685,7 +719,7 @@ async def solve_dependencies(
             call = getattr(
                 dependency_overrides_provider, "dependency_overrides", {}
             ).get(original_call, original_call)
-            use_path: str = sub_dependant.path  # type: ignore
+            use_path = sub_dependant.path  # type: ignore
             use_sub_dependant = get_dependant(
                 path=use_path,
                 call=call,
@@ -705,6 +739,7 @@ async def solve_dependencies(
             async_exit_stack=async_exit_stack,
             embed_body_fields=embed_body_fields,
             _uses_scopes_cache=_uses_scopes_cache,
+            _policy_snapshot=_policy_snapshot,
         )
         background_tasks = solved_result.background_tasks
         if solved_result.errors:
@@ -714,6 +749,15 @@ async def solve_dependencies(
             dependant=sub_dependant,
             uses_scopes_cache=_uses_scopes_cache,
         )
+        if _policy_snapshot is not None:
+            # The cache partition and the extra OAuth scopes only add a
+            # dimension: different partitions/scope combinations must never
+            # reuse a cached value, while the empty-stack key stays the same.
+            sub_dependant_cache_key = policy_partitions_cache_key(
+                sub_dependant_cache_key,
+                cache_partition=_policy_snapshot.cache_partition,
+                extra_oauth_scopes=_policy_snapshot.extra_oauth_scopes,
+            )
         if sub_dependant.use_cache and sub_dependant_cache_key in dependency_cache:
             solved = dependency_cache[sub_dependant_cache_key]
         elif _is_gen_callable(use_sub_dependant.call) or _is_async_gen_callable(
@@ -779,8 +823,15 @@ async def solve_dependencies(
     if dependant.response_param_name:
         values[dependant.response_param_name] = response
     if dependant.security_scopes_param_name:
+        security_scopes = _get_oauth_scopes(dependant=dependant)
+        if _policy_snapshot is not None:
+            # Append the temporary scopes pushed on the policy stack on top of
+            # the scopes statically declared by the dependant subtree.
+            for extra_scope in _policy_snapshot.extra_oauth_scopes:
+                if extra_scope not in security_scopes:
+                    security_scopes.append(extra_scope)
         values[dependant.security_scopes_param_name] = SecurityScopes(
-            scopes=_get_oauth_scopes(dependant=dependant)
+            scopes=security_scopes
         )
     return SolvedDependency(
         values=values,

@@ -2,6 +2,7 @@ from collections.abc import Callable
 from typing import Annotated, Any
 
 from annotated_doc import Doc
+from fastapi.dependencies.policy import _empty_dependency_policy_stack
 from fastapi.telemetry._api import _operation
 from starlette.background import BackgroundTasks as StarletteBackgroundTasks
 from typing_extensions import ParamSpec
@@ -62,6 +63,12 @@ class BackgroundTasks(StarletteBackgroundTasks):
         return super().add_task(func, *args, **kwargs)
 
     async def __call__(self) -> None:
-        for task in self.tasks:
-            with _operation(name="background_task", function=task.func):
-                await task()
+        # Background tasks run after the response has been handed to the
+        # client. They must observe an empty request-level dependency policy
+        # stack: nested dependency solving inside a task cannot read a frame
+        # the previous request forgot to pop. Application-level
+        # dependency_overrides stay in effect.
+        with _empty_dependency_policy_stack():
+            for task in self.tasks:
+                with _operation(name="background_task", function=task.func):
+                    await task()
